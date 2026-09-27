@@ -1,0 +1,378 @@
+name: Release fork build
+
+# Publishes fork release binaries: builds are the official upstream jobs
+# (from .github/workflows/build.yml), restricted to only the targets this
+# fork actually needs: darwin/arm64, linux/amd64 (glibc, with naive/cronet),
+# windows/amd64 (with naive/cronet), and the Android APK (debug-signed,
+# since we don't hold SagerNet's release signing secret).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  calculate_version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.outputs.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Calculate version
+        run: |-
+          go run -v ./cmd/internal/read_tag --ci
+      - name: Set outputs
+        id: outputs
+        run: |-
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build_linux_amd64:
+    name: Build Linux amd64 (glibc, naive)
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Clone cronet-go
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          git init ~/cronet-go
+          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go sparse-checkout set --no-cone '/*' '!/lib'
+          git -C ~/cronet-go fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go checkout FETCH_HEAD
+          git -C ~/cronet-go submodule update --init --recursive --depth=1
+      - name: Regenerate Debian keyring
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+      - name: Download Chromium toolchain
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/amd64 download-toolchain
+      - name: Set Chromium toolchain environment
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/amd64 env >> $GITHUB_ENV
+      - name: Set tag
+        run: |-
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Set build tags
+        run: |
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS)" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Build
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+      - name: Extract libcronet.so
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          LIBRARY_PATH="lib/linux_amd64/libcronet.so"
+          git init "$RUNNER_TEMP/cronet-go-lib"
+          git -C "$RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          cp "$RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist/
+      - name: Archive
+        run: |
+          set -xeuo pipefail
+          cd dist
+          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-linux-amd64-glibc"
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}"
+          cp sing-box libcronet.so "${DIR_NAME}"
+          tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -r "${DIR_NAME}"
+      - name: Cleanup
+        run: rm -f dist/sing-box dist/libcronet.so
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-linux_amd64-glibc
+          path: dist
+
+  build_darwin_arm64:
+    name: Build Darwin arm64
+    runs-on: macos-latest
+    needs:
+      - calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Set tag
+        run: |-
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Set build tags
+        run: |
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS)" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Build
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "1"
+          GOOS: darwin
+          GOARCH: arm64
+      - name: Archive
+        run: |
+          set -xeuo pipefail
+          cd dist
+          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-darwin-arm64"
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}"
+          cp sing-box "${DIR_NAME}"
+          tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -r "${DIR_NAME}"
+      - name: Cleanup
+        run: rm dist/sing-box
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-darwin_arm64
+          path: dist
+
+  build_windows_amd64:
+    name: Build Windows amd64 (naive)
+    runs-on: windows-latest
+    needs:
+      - calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Set tag
+        run: |-
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Build
+        run: |
+          $TAGS = Get-Content release/DEFAULT_BUILD_TAGS_WINDOWS
+          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS" `
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+      - name: Extract libcronet.dll
+        run: |
+          $CRONET_GO_VERSION = Get-Content .github/CRONET_GO_VERSION
+          $LIBRARY_PATH = "lib/windows_amd64/libcronet.dll"
+          git init "$env:RUNNER_TEMP/cronet-go-lib"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          Copy-Item "$env:RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist
+      - name: Archive
+        run: |
+          $DIR_NAME = "sing-box-${{ needs.calculate_version.outputs.version }}-windows-amd64"
+          mkdir "dist/$DIR_NAME"
+          Copy-Item LICENSE "dist/$DIR_NAME"
+          Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
+          Copy-Item "dist/libcronet.dll" "dist/$DIR_NAME"
+          Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
+          Remove-Item -Recurse "dist/$DIR_NAME"
+      - name: Cleanup
+        run: Remove-Item dist/sing-box.exe, dist/libcronet.dll
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-windows_amd64
+          path: dist
+
+  build_android_library:
+    name: Build Android library (${{ matrix.go_arch }})
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+    strategy:
+      fail-fast: false
+      matrix:
+        go_arch: ["386", amd64, arm, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Set tag
+        run: |-
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Build library
+        run: |-
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target android -platform android/${{ matrix.go_arch }}
+          mkdir -p dist/${{ matrix.go_arch }}
+          mv libbox.aar libbox-legacy.aar dist/${{ matrix.go_arch }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-android-${{ matrix.go_arch }}
+          path: dist
+          compression-level: 0
+
+  build_android:
+    name: Build Android APK (debug-signed)
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+      - build_android_library
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Checkout Android client
+        run: git submodule update --init clients/android
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Set tag
+        run: |-
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Download libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libbox-android-*
+          path: libbox-inputs
+          merge-multiple: true
+      - name: Merge libraries
+        run: |-
+          go run ./cmd/internal/merge_aar -output libbox.aar libbox-inputs/*/libbox.aar
+          go run ./cmd/internal/merge_aar -output libbox-legacy.aar libbox-inputs/*/libbox-legacy.aar
+      - name: Checkout submodule recursive
+        run: |-
+          cd clients/android
+          git submodule update --init --recursive -v
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Set version
+        run: |-
+          go run -v ./cmd/internal/update_android_version --ci
+      - name: Build (debug-signed, no release keystore available in this fork)
+        run: |-
+          mkdir -p clients/android/app/libs
+          cp *.aar clients/android/app/libs
+          cd clients/android
+          ./gradlew --build-cache --parallel :app:assembleOtherDebug :app:assembleOtherLegacyDebug
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Prepare upload
+        run: |-
+          mkdir -p dist
+          cp clients/android/app/build/outputs/apk/other/debug/*.apk dist
+          cp clients/android/app/build/outputs/apk/otherLegacy/debug/*.apk dist
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-android-apks
+          path: dist
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+      - build_linux_amd64
+      - build_darwin_arm64
+      - build_windows_amd64
+      - build_android
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.calculate_version.outputs.version }}
+          files: dist/*
+          generate_release_notes: true
