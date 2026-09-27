@@ -199,4 +199,4 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing-openconnect => github.com/iamtrazy/sing-openconnect v0.0.0-20260927131917-b7937373f5fe
+replace github.com/sagernet/sing-openconnect => ./thirdparty/sing-openconnect
