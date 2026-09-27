@@ -334,7 +334,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
       - name: Set version
         run: |-
-          go run -v ./cmd/internal/update_android_version --ci
+          set -euo pipefail
+          sed -i "s/^VERSION_NAME=.*/VERSION_NAME=${{ needs.calculate_version.outputs.version }}/" clients/android/version.properties
+          cat clients/android/version.properties
       - name: Build (debug-signed, no release keystore available in this fork)
         run: |-
           mkdir -p clients/android/app/libs
