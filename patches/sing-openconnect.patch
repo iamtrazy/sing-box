@@ -1,0 +1,165 @@
+diff --git a/fortinet_auth.go b/fortinet_auth.go
+index ae99b26..f0117a2 100644
+--- a/fortinet_auth.go
++++ b/fortinet_auth.go
+@@ -638,6 +638,28 @@ func (a *fortinetAuthentication) buildAuthenticationRequest(
+ 		}
+ 		if initial && field.name == "credential" {
+ 			requestField.CacheKey = authCachePassword
++			// Fork-only extension: some Fortinet gateways validate password+token as a
++			// single concatenated credential in one round-trip (the same convention
++			// real openconnect/FortiClient use for "append mode" 2FA), rather than the
++			// separate password + code round-trip this client otherwise implements.
++			if a.tokenGenerator.CanGenerate(form.message) && a.tokenGenerator.options.AppendToPassword {
++				password := a.frontend.client.options.Password
++				tokenMessage := form.message
++				generator := a.tokenGenerator
++				requestField.CacheKey = ""
++				// Kind=token excludes this field from the interactive challenge entirely
++				// (matching how the built-in separate "code" round already behaves),
++				// instead of showing an empty field the dashboard would otherwise require
++				// the user to fill in before it lets the (discarded) form submit.
++				requestField.Kind = authFormFieldToken
++				requestField.Automatic = func(ctx context.Context) (string, error) {
++					code, err := generator.Generate(ctx, tokenMessage)
++					if err != nil {
++						return "", err
++					}
++					return password + code, nil
++				}
++			}
+ 		}
+ 		if !initial && (field.name == "code" || field.name == "credential") && field.kind == AuthFormFieldPassword && a.tokenGenerator.CanGenerate(form.message) {
+ 			requestField.Kind = authFormFieldToken
+diff --git a/fortinet_session.go b/fortinet_session.go
+index 87cd35c..207ac3a 100644
+--- a/fortinet_session.go
++++ b/fortinet_session.go
+@@ -171,7 +171,9 @@ func (s *fortinetSession) connectPPPTLS() (pppSessionCarrier, error) {
+ 	if portErr != nil {
+ 		return pppSessionCarrier{}, portErr
+ 	}
+-	destination := M.ParseSocksaddrHostPort(s.snapshot.acceptedAddress.String(), serverPort)
++	// Fork-only fix: see pinned_http.go for why dialing the pinned peer address
++	// (rather than the hostname) breaks detour/proxy routing.
++	destination := M.ParseSocksaddrHostPort(s.snapshot.serverURL.Hostname(), serverPort)
+ 	dialer := s.client.options.Dialer
+ 	rawConnection, dialErr := dialer.DialContext(s.ctx, N.NetworkTCP, destination)
+ 	if dialErr != nil {
+@@ -238,8 +240,9 @@ func (s *fortinetSession) connectPPPDTLS(ctx context.Context) (pppSessionCarrier
+ 	if tlsConfiguration.ServerName == "" {
+ 		tlsConfiguration.ServerName = s.snapshot.serverURL.Hostname()
+ 	}
++	// Fork-only fix: see pinned_http.go; dial by hostname, not the pinned peer address.
+ 	connection, connectErr := connectCertificateDTLS(ctx, certificateDTLSNegotiation{
+-		Address:    net.JoinHostPort(s.snapshot.acceptedAddress.String(), strconv.Itoa(int(serverPort))),
++		Address:    net.JoinHostPort(s.snapshot.serverURL.Hostname(), strconv.Itoa(int(serverPort))),
+ 		ServerName: s.snapshot.serverURL.Hostname(),
+ 		TLSConfig:  tlsConfiguration,
+ 		Dialer:     s.client.options.Dialer,
+diff --git a/gp_auth.go b/gp_auth.go
+index 2a688bb..6ae95fe 100644
+--- a/gp_auth.go
++++ b/gp_auth.go
+@@ -917,7 +917,8 @@ func (f *gpFrontend) logout(ctx context.Context, snapshot gpSessionSnapshot) err
+ 		if parseErr != nil || parsedPort == 0 {
+ 			return nil, E.New("logout attempted to dial an invalid gateway port")
+ 		}
+-		destination := M.ParseSocksaddrHostPort(snapshot.authenticatedAddress.String(), uint16(parsedPort))
++		// Fork-only fix: see pinned_http.go; dial by hostname, not the pinned peer address.
++		destination := M.ParseSocksaddrHostPort(gatewayHostname, uint16(parsedPort))
+ 		return f.client.options.Dialer.DialContext(dialContext, network, destination)
+ 	}
+ 	logoutClient := &http.Client{
+diff --git a/gp_config.go b/gp_config.go
+index ea27512..737bd2b 100644
+--- a/gp_config.go
++++ b/gp_config.go
+@@ -89,12 +89,12 @@ func (f *gpFrontend) fetchTunnelConfiguration(ctx context.Context, snapshot gpSe
+ 		if parseErr != nil || parsedPort == 0 {
+ 			return nil, markTerminal(E.New("configuration attempted to dial an invalid gateway port"))
+ 		}
+-		destinationHost := gatewayHostname
+-		if snapshot.authenticatedAddress.IsValid() {
+-			destinationHost = snapshot.authenticatedAddress.String()
+-		}
++		// Fork-only fix: see the matching comment in pinned_http.go. Pinning to
++		// snapshot.authenticatedAddress breaks every request through this client
++		// whenever the dial is routed through a detour/proxy outbound, since that
++		// recorded address is the proxy's, not the real gateway's.
+ 		dialer := f.client.options.Dialer
+-		destination := M.ParseSocksaddrHostPort(destinationHost, uint16(parsedPort))
++		destination := M.ParseSocksaddrHostPort(gatewayHostname, uint16(parsedPort))
+ 		return dialer.DialContext(dialContext, network, destination)
+ 	}
+ 	configurationClient := &http.Client{
+diff --git a/gp_gpst.go b/gp_gpst.go
+index 878ebc7..5d67548 100644
+--- a/gp_gpst.go
++++ b/gp_gpst.go
+@@ -240,8 +240,9 @@ func (c *gpstChannel) connect() (*tls.Conn, error) {
+ 	if err != nil || gatewayPort == 0 {
+ 		return nil, markTerminal(E.New("gateway has an invalid GPST port"))
+ 	}
++	// Fork-only fix: see pinned_http.go; dial by hostname, not the pinned peer address.
+ 	dialer := c.config.Client.options.Dialer
+-	destination := M.ParseSocksaddrHostPort(c.config.Snapshot.authenticatedAddress.Unmap().String(), uint16(gatewayPort))
++	destination := M.ParseSocksaddrHostPort(gatewayHostname, uint16(gatewayPort))
+ 	rawConnection, err := dialer.DialContext(c.ctx, N.NetworkTCP, destination)
+ 	if err != nil {
+ 		return nil, E.Cause(err, "connect GPST TCP transport")
+diff --git a/gp_hip.go b/gp_hip.go
+index 6db370b..e27575a 100644
+--- a/gp_hip.go
++++ b/gp_hip.go
+@@ -202,7 +202,8 @@ func (r *gpHIPRunner) Check(ctx context.Context) (gpHIPCheckResult, error) {
+ 		if err != nil || parsedPort == 0 {
+ 			return nil, markTerminal(E.New("HIP attempted to dial an invalid gateway port"))
+ 		}
+-		destination := M.ParseSocksaddrHostPort(r.authenticatedAddress.String(), uint16(parsedPort))
++		// Fork-only fix: see pinned_http.go; dial by hostname, not the pinned peer address.
++		destination := M.ParseSocksaddrHostPort(gatewayHost, uint16(parsedPort))
+ 		dialer := r.client.options.Dialer
+ 		conn, err := dialer.DialContext(dialContext, network, destination)
+ 		if err != nil {
+diff --git a/options.go b/options.go
+index c56d94e..4613a7d 100644
+--- a/options.go
++++ b/options.go
+@@ -28,6 +28,10 @@ type TokenOptions struct {
+ 	DeviceID      string
+ 	Counter       uint64
+ 	UpdateCounter func(ctx context.Context, counter uint64) error
++	// AppendToPassword is a fork-only extension (not upstream). See
++	// OpenConnectTokenOptions.AppendToPassword in sing-box's option package
++	// for the config-facing documentation of this behavior.
++	AppendToPassword bool
+ }
+ 
+ type CSDOptions struct {
+diff --git a/pinned_http.go b/pinned_http.go
+index 091b314..c9a50c8 100644
+--- a/pinned_http.go
++++ b/pinned_http.go
+@@ -50,12 +50,15 @@ func newPinnedHTTPClient(
+ 		if !strings.EqualFold(destinationHostname, expectedHostname) || uint16(destinationPort) != expectedPort {
+ 			return nil, E.New(protocolName, " request attempted to dial outside the accepted endpoint")
+ 		}
+-		destinationHost := expectedHostname
+-		acceptedPeerAddress := peer.address
+-		if acceptedPeerAddress.IsValid() {
+-			destinationHost = acceptedPeerAddress.String()
+-		}
+-		destination := M.ParseSocksaddrHostPort(destinationHost, expectedPort)
++		// Fork-only fix: upstream substitutes the dial target with the peer address
++		// recorded via httptrace.GotConn from the authenticating connection, to pin
++		// later requests to the same physical backend. That recorded address is
++		// meaningless (it's the proxy's address, not the real server's) whenever the
++		// dial is routed through a detour/proxy outbound, which broke every request
++		// made through this pinned client when a "detour" is configured. Always
++		// dialing by hostname lets client.options.Dialer (which is already
++		// detour-aware) resolve consistently instead.
++		destination := M.ParseSocksaddrHostPort(expectedHostname, expectedPort)
+ 		connection, dialErr := client.options.Dialer.DialContext(ctx, network, destination)
+ 		if dialErr != nil {
+ 			return nil, E.Cause(dialErr, "dial ", protocolName, " accepted endpoint")
