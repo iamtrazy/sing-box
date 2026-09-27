@@ -49,13 +49,21 @@ type OpenConnectEndpointOptions struct {
 }
 
 type OpenConnectTokenOptions struct {
-	Mode       string `json:"mode,omitempty" enum:"totp,hotp,stoken,oidc"`
-	Secret     string `json:"secret,omitempty"`
-	SecretPath string `json:"secret_path,omitempty"`
-	PIN        string `json:"pin,omitempty"`
-	Password   string `json:"password,omitempty"`
-	DeviceID   string `json:"device_id,omitempty"`
-	Counter    uint64 `json:"counter,omitempty"`
+	Mode             string `json:"mode,omitempty" enum:"totp,hotp,stoken,oidc"`
+	Secret           string `json:"secret,omitempty"`
+	SecretPath       string `json:"secret_path,omitempty"`
+	PIN              string `json:"pin,omitempty"`
+	Password         string `json:"password,omitempty"`
+	DeviceID         string `json:"device_id,omitempty"`
+	Counter          uint64 `json:"counter,omitempty"`
+	// AppendToPassword is a fork-only extension (not upstream sing-box).
+	// When true, the generated token code is concatenated directly onto the
+	// password field of the initial Fortinet credential submission instead of
+	// being submitted as a separate "code" field in a second round-trip.
+	// Required by Fortinet gateways configured for combined password+token
+	// local authentication (the same convention real openconnect/FortiClient
+	// use when piping "$password$totp" as a single credential).
+	AppendToPassword bool `json:"append_to_password,omitempty"`
 }
 
 type OpenConnectMobileOptions struct {

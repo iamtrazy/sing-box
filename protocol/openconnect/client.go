@@ -223,13 +223,14 @@ func (e *Endpoint) buildClientOptions(options option.OpenConnectEndpointOptions,
 	var tokenOptions *openconnect.TokenOptions
 	if options.Token != nil {
 		tokenOptions = &openconnect.TokenOptions{
-			Mode:       options.Token.Mode,
-			Secret:     options.Token.Secret,
-			SecretPath: options.Token.SecretPath,
-			PIN:        options.Token.PIN,
-			Password:   options.Token.Password,
-			DeviceID:   options.Token.DeviceID,
-			Counter:    options.Token.Counter,
+			Mode:             options.Token.Mode,
+			Secret:           options.Token.Secret,
+			SecretPath:       options.Token.SecretPath,
+			PIN:              options.Token.PIN,
+			Password:         options.Token.Password,
+			DeviceID:         options.Token.DeviceID,
+			Counter:          options.Token.Counter,
+			AppendToPassword: options.Token.AppendToPassword,
 		}
 		if tokenOptions.Mode == openconnect.TokenModeHOTP {
 			e.hotpCounter.Store(tokenOptions.Counter)
